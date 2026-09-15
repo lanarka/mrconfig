@@ -1,0 +1,5 @@
+
+[languages]
+	sk: {
+		greeting: "Ahoj"
+	}
