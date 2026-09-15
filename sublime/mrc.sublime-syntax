@@ -1,0 +1,65 @@
+%YAML 1.2
+---
+# See http://www.sublimetext.com/docs/syntax.html
+# ~/.config/sublime-text/Packages/User/mrc.sublime-syntax
+
+file_extensions:
+  - mrc
+
+scope: source.mrc
+contexts:
+  main:
+    # Directives
+    - match: '!(include|use)\b'
+      scope: entity.name.function.mrc
+
+    # String
+    - match: '"'
+      scope: punctuation.definition.string.begin.mrc
+      push: double_quoted_string
+
+    # Decimal Number
+    - match: '\b(-)?[0-9.]+\b'
+      scope: keyword.control.mrc
+
+    # Hexadecimal Number
+    - match: (0[xX])((?:_?\h)+)
+      scope: keyword.control.mrc
+
+    # Binary Number
+    - match: (0[xb])((?:_?\h)+)
+      scope: keyword.control.mrc
+
+    # Line Comment
+    - match: '//'
+      scope: punctuation.definition.comment.mrc
+      push: line_comment
+
+    # Block Comment
+    - match: '/\*'
+      scope: punctuation.definition.comment.mrc
+      push: 
+        - meta_scope: comment.block.mrc
+        - match: '\*/'
+          pop: true
+
+    # Key
+    - match: \b\w+(?=\:)
+      scope: entity.name.tag.mrc
+
+    # Section
+    - match: '\[([^\]]+)\]'
+      scope: markup.bold.mrc
+
+  double_quoted_string:
+    - meta_scope: string.quoted.double.mrc
+    - match: '\\.'
+      scope: constant.character.escape.mrc
+    - match: '"'
+      scope: punctuation.definition.string.end.mrc
+      pop: true
+
+  line_comment:
+    - meta_scope: comment.line.mrc
+    - match: $
+      pop: true
