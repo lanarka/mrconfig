@@ -1,4 +1,4 @@
-# MrCFG
+# MrConfig
 
 A simple yet powerful configuration file format for C99 projects.  
 Inspired by INI,TOML, extended with references, arrays, maps, environment variables, and an include system.
