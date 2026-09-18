@@ -5,8 +5,24 @@
 #include "loader.h"
 #include "utils.h"
 
+/*
+ * loader.c has two independent jobs:
+ *   1) path resolution + get/set API that works on any in-memory Config,
+ *      whether it came from the text parser or from config_load() below;
+ *   2) the binary reader (config_load) and its little "xread" helpers
+ *      that mirror the writer in compiler.c.
+ */
+
+/* Resolves a dotted path like "Section.key.field.2" against cfg, falling
+ * back to section `rel` when the first component isn't a section name
+ * (so a REF written inside a section can refer to its own siblings by
+ * bare key name). Returns NULL if any component along the way is missing
+ * or of the wrong kind (e.g. indexing into a non-array). */
 Value *resolve_path(Config *cfg, Section *rel, const char *path) {
     if (!path || !*path) return NULL;
+    /* NOTE: paths longer than 511 chars are silently truncated here (and
+     * in api_kv()/sec_of() below). Not a memory-safety issue, but a
+     * mistyped very long path fails "quietly" instead of with an error. */
     char tmp[512]; strncpy(tmp, path, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
 
     char *parts[16]; int np = 0;
@@ -37,12 +53,19 @@ Value *resolve_path(Config *cfg, Section *rel, const char *path) {
     return cur;
 }
 
+/* Follows a chain of REF values until it hits a concrete value (or NULL
+ * on a dangling/unresolved ref). depth>256 is a cycle guard; genuine
+ * cycles are normally caught earlier by config_check_refs() at parse
+ * time, but config_load() reads binaries without re-validating refs. */
 static Value *deref(Config *cfg, Section *sec, Value *v, int depth) {
     if (!v || depth > 256) return NULL;
     if (v->type != VAL_REF) return v;
     return deref(cfg, sec, resolve_path(cfg, sec, v->sval), depth+1);
 }
 
+/* Splits a top-level "Section.key" path (exactly those two components -
+ * this is what the scalar config_get_ and config_set_ functions use,
+ * as opposed to resolve_path() which also walks into maps/arrays). */
 static KeyValue *api_kv(Config *cfg, const char *path, Section **os) {
     char tmp[512]; strncpy(tmp, path, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
     char *p0 = strtok(tmp, "."), *p1 = strtok(NULL, ".");
@@ -112,6 +135,12 @@ double config_get_map_float(Config *cfg, const char *path) {
     return 0.0;
 }
 
+/* Binary reader:
+ * Mirrors the writer in compiler.c (write_u8/write_u32be/... + dump_val).
+ * Everything is big-endian on disk so the format is portable regardless
+ * of the host's native endianness; see the README's "Binary Format"
+ * section for the exact byte layout. */
+
 static void xread(FILE *f, void *buf, size_t n) {
     if (fread(buf, 1, n, f) != n) {
         fprintf(stderr, "mrcfg: unexpected end of binary file\n");
@@ -147,6 +176,9 @@ static double read_f64be(FILE *f) {
     double v; memcpy(&v, &u, 8); return v;
 }
 
+/* Strings are stored as "length + bytes", where length already includes
+ * the trailing NUL (see write_str() in compiler.c), so the buffer read
+ * here is already a valid C string with no extra terminator needed. */
 static char *read_str(FILE *f) {
     uint32_t len = read_u32be(f);
     char *s = malloc(len);
@@ -194,6 +226,10 @@ static Value load_val(FILE *f) {
     return v;
 }
 
+/* Reads a full .bin file written by config_dump()/config_update() and
+ * rebuilds a Config in memory. Exits the process on any structural
+ * problem (bad magic, unsupported version, truncated file) - this
+ * mirrors config_open()'s "fatal on error" style for the text parser. */
 Config config_load(const char *fn) {
     FILE *f = fopen(fn, "rb");
     if (!f) { perror(fn); exit(1); }
@@ -235,6 +271,8 @@ Config config_load(const char *fn) {
     return cfg;
 }
 
+/* Frees the contents of *v (not v itself) and resets it to VAL_UNKNOWN,
+ * recursing into arrays/maps. Safe to call on an already-freed Value. */
 void free_val(Value *v) {
     if (!v) return;
     switch (v->type) {
@@ -272,6 +310,8 @@ void config_free(Config *cfg) {
     free(cfg->sections); cfg->sections = NULL; cfg->sectionCount = 0;
 }
 
+/* Recursive pretty-printer used by config_print(); "ind" is the current
+ * indentation level in spaces, only relevant for nested maps. */
 static void prv(const Value *v, int ind) {
     if (!v) return;
     switch (v->type) {
@@ -300,6 +340,10 @@ static void prv(const Value *v, int ind) {
     }
 }
 
+/* All config_set_*() calls go through here: same lookup as
+ * resolve_path(), but with a friendlier warning when the caller forgot
+ * the "Section." prefix (a very easy mistake since resolve_path() alone
+ * also accepts a bare key relative to `rel`, which set_* never has). */
 static Value *resolve_for_set(Config *cfg, const char *path) {
     if (path && !strchr(path, '.')) {
         fprintf(stderr,
@@ -371,6 +415,9 @@ int config_set_map(Config *cfg, const char *path, MapEntry *entries, int count) 
     return 1;
 }
 
+/* Binary writer primitives are implemented in compiler.c (shared with
+ * config_dump()); declared here so config_update() can reuse them
+ * instead of duplicating the binary format logic. */
 extern void write_u8   (FILE *f, uint8_t  v);
 extern void write_u32be(FILE *f, uint32_t v);
 extern void write_i64be(FILE *f, int64_t  v);
@@ -378,6 +425,9 @@ extern void write_f64be(FILE *f, double   v);
 extern void write_str  (FILE *f, const char *s);
 extern void dump_val   (FILE *f, const Value *v);
 
+/* Re-serializes cfg to the file it was originally config_load()'ed
+ * from. Only valid after config_load(); a Config built via config_open()
+ * has no _filename and must be written with config_dump() instead. */
 void config_update(Config *cfg) {
     if (!cfg->_filename) {
         fprintf(stderr, "mrcfg: config_update: no filename known\n");
@@ -402,6 +452,9 @@ void config_update(Config *cfg) {
     fclose(f);
 }
 
+/* Human-readable dump of the whole config to stdout, used by the CLI's
+ * -c/-l modes and handy for debugging from your own code too. REF
+ * values are shown unresolved, as REF(path), not followed. */
 void config_print(const Config *cfg) {
     for (int i=0; i<cfg->sectionCount; ++i) {
         const Section *s = &cfg->sections[i];

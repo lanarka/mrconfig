@@ -1,3 +1,9 @@
+/*
+ * utils.h - small string/lookup helpers shared by the parser and the
+ * binary loader. Nothing here is public API; it's included by loader.c
+ * and compiler.c only.
+ */
+
 #ifndef UTILS_H
 #define UTILS_H
 

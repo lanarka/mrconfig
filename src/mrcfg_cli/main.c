@@ -1,3 +1,9 @@
+/*
+ * mrcfg_cli - thin command-line front-end over the mrcfg_api library.
+ * All the real work (parsing, compiling, loading) lives in the API;
+ * this file is just argument handling + wiring.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include "compiler.h"

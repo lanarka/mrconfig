@@ -1,3 +1,24 @@
+/*
+ * compiler.c turns a .mrc text file into a Config, in three passes:
+ *
+ *   1) preprocess()   - strips comments, joins "\"-continued lines,
+ *                        tracks a line-number map for error messages.
+ *   2) parse_config_into() - line-oriented pass: sections, "!include"/
+ *                        "!use" directives, and "key: <raw value text>"
+ *                        pairs, handing each value off to parse_seg().
+ *   3) parse_seg()/parse_tok()/parse_array_body()/parse_map_body() -
+ *                        recursive-descent parsing of a single value
+ *                        (scalar, array, map, or nested combinations).
+ *
+ * Afterwards config_check_refs() walks the whole tree and fails fast if
+ * any REF points nowhere, so a caller of config_open() never has to
+ * handle "reference not found" at get-time for text-parsed configs.
+ *
+ * All parse errors call exit(1) after printing "file:line: message" -
+ * this is a config *compiler*, so it favours failing loudly over
+ * returning error codes the caller has to remember to check.
+ */
+
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -22,6 +43,8 @@
 #define SLUG_MAX 64
 #define MAX_INCLUDE_DEPTH 32
 
+/* Enforces the "letters, digits, _" rule for section/key/map-key names
+ * (SLUG_MAX chars max), exiting with a file:line error otherwise. */
 static void validate_slug(const char *name, const char *what,
                            const char *filename, int line_no) {
     if (!name || !*name) {
@@ -44,8 +67,14 @@ static void validate_slug(const char *name, const char *what,
     }
 }
 
+/* PreBuf.lmap[i] gives the original source line number for byte i of
+ * buf, so error messages after preprocessing still point at the line
+ * the user actually wrote (comments/continuations having shifted
+ * everything around). */
 typedef struct { char *buf; int *lmap; } PreBuf;
 
+/* Reads the whole file into a NUL-terminated heap buffer, or NULL on
+ * failure to open (caller reports the error with context). */
 static char *read_all(const char *fn) {
     FILE *f = fopen(fn, "rb");
     if (!f) return NULL;
@@ -56,6 +85,11 @@ static char *read_all(const char *fn) {
     b[n] = '\0'; fclose(f); return b;
 }
 
+/* Single pass over the raw source that removes line and block comments,
+ * joins backslash-newline continuations into one space, and copies
+ * everything else through unchanged (string contents are passed through
+ * verbatim so comments/escapes inside "..." are left alone). Builds the
+ * line map described above as it goes. */
 static PreBuf preprocess(const char *src, const char *filename) {
     size_t n = strlen(src);
     char *dst = malloc(n + 1);
@@ -126,6 +160,9 @@ static PreBuf preprocess(const char *src, const char *filename) {
 static Value parse_map_body  (char **pp, const char *orig, const char *filename, int line_no);
 static Value parse_array_body(char **pp, const char *orig, const char *filename, int line_no);
 
+/* Parses a bare "$NAME" (not inside a string) into its environment
+ * value, auto-detecting INT/FLOAT the same way a literal token would.
+ * Exits with an error if the variable isn't set. */
 static Value resolve_env(char **pp, const char *filename, int line_no) {
     char *s = *pp;
     if (!isalpha((unsigned char)*s) && *s != '_')
@@ -146,6 +183,10 @@ static Value resolve_env(char **pp, const char *filename, int line_no) {
     return v;
 }
 
+/* Parses one value token: a "string" (with escapes, $VAR interpolation,
+ * and automatic concatenation of adjacent "a" "b" literals), a nested
+ * {map} or (array), a bare $VAR, or a bare word/number (REF or
+ * INT/FLOAT, decided by is_num()). Leaves *pp right after the token. */
 static Value parse_tok(char **pp, const char *orig, const char *filename, int line_no) {
     char *s = *pp;
     while (*s && isspace((unsigned char)*s)) s++;
@@ -159,10 +200,12 @@ static Value parse_tok(char **pp, const char *orig, const char *filename, int li
                 if (*s=='"' && !is_esc(orig, s)) { s++; break; }
                 if (*s=='\\' && s[1]) {
                     char e = s[1];
-                    if      (e=='n') b[bi++] = '\n';
-                    else if (e=='t') b[bi++] = '\t';
-                    else if (e=='r') b[bi++] = '\r';
-                    else              b[bi++] = e;
+                    char c = (e=='n') ? '\n' : (e=='r') ? '\r' : (e=='t') ? '\t' : e;
+                    /* Bounds check: without it, a string literal longer
+                     * than sizeof(b) with escape sequences would overflow
+                     * this stack buffer (unlike the plain-char branch
+                     * below, which was already guarded). */
+                    if (bi < (int)sizeof(b)-1) b[bi++] = c;
                     s += 2;
                 } else if (*s=='$' && !is_esc(orig, s)) {
                     s++;
@@ -219,6 +262,9 @@ static Value parse_tok(char **pp, const char *orig, const char *filename, int li
     return v;
 }
 
+/* Parses the body of "(...)" after the opening '(' has been consumed.
+ * Elements are comma-separated; a stray ')' with no matching '(' or a
+ * missing ',' both end the parse with an error. */
 static Value parse_array_body(char **pp, const char *orig, const char *filename, int line_no) {
     Value av; memset(&av, 0, sizeof(av)); av.type = VAL_ARRAY;
     char *s = *pp;
@@ -245,6 +291,10 @@ static Value parse_array_body(char **pp, const char *orig, const char *filename,
     return av;
 }
 
+/* Parses the body of "{...}" after the opening '{' has been consumed.
+ * Each entry is "key: value"; the tail of this function is mostly
+ * lookahead logic to give a clear error when an array is written
+ * without its required '(' ')' (a bare "1, 2, 3" after ':'). */
 static Value parse_map_body(char **pp, const char *orig, const char *filename, int line_no) {
     Value mv; memset(&mv, 0, sizeof(mv)); mv.type = VAL_MAP;
     char *s = *pp;
@@ -331,6 +381,10 @@ static Value parse_map_body(char **pp, const char *orig, const char *filename, i
     return mv;
 }
 
+/* Parses one "key: <value>" right-hand side, already isolated by the
+ * caller (parse_config_into): dispatches to parse_map_body/
+ * parse_array_body/parse_tok depending on the first non-space char, and
+ * makes sure nothing unexpected trails after the value. */
 static void parse_seg(char *seg, KeyValue *kv, const char *filename) {
     char *s = seg;
     while (*s && isspace((unsigned char)*s)) s++;
@@ -366,6 +420,9 @@ static void parse_seg(char *seg, KeyValue *kv, const char *filename) {
 }
 
 
+/* Tracks the chain of files currently being parsed (via !include/!use)
+ * so inc_push() can detect a file including itself, directly or through
+ * a longer cycle, and reject it instead of recursing forever. */
 typedef struct { const char *files[MAX_INCLUDE_DEPTH]; int depth; } IncStack;
 static IncStack g_inc = { {NULL}, 0 };
 
@@ -384,6 +441,11 @@ static void inc_pop(void) {
     if (g_inc.depth>0) g_inc.depth--; 
 }
 
+/* Recursively replaces every REF inside v with the concrete value it
+ * points to in use_cfg (falling back to a plain deep copy for refs that
+ * don't resolve there, and for scalars). This is what makes "!use"
+ * different from "!include": the imported sections themselves are
+ * thrown away, only the resolved values survive in the caller's cfg. */
 static Value eval_use_ref(Config *use_cfg, Value *v) {
     if (v->type == VAL_REF) {
         Value *t = resolve_path(use_cfg, NULL, v->sval);
@@ -412,18 +474,13 @@ static Value eval_use_ref(Config *use_cfg, Value *v) {
     return deep_copy_val(v);
 }
 
-static void apply_use(Config *cfg, Config *use_cfg) {
-    for (int si=0; si<cfg->sectionCount; ++si) {
-        Section *sec=&cfg->sections[si];
-        for (int ki=0; ki<sec->keyCount; ++ki) {
-            KeyValue *kv=&sec->keys[ki];
-            Value resolved=eval_use_ref(use_cfg,&kv->value);
-            free_val(&kv->value);
-            kv->value=resolved;
-        }
-    }
-}
-
+/* The main line-oriented parsing loop: reads preprocessed lines from
+ * `filename`, handling !include/!use directives, "[section]" headers,
+ * and "key: value" pairs (collecting extra lines into `acc` while brace
+ * depth > 0, so a map value may legally span several lines). Recurses
+ * into itself for !include; !use files are parsed into a throwaway
+ * Config and only used to resolve refs (see eval_use_ref) once this
+ * file's own keys have all been added to cfg. */
 static void parse_config_into(Config *cfg, const char *filename,
                               const char *caller_file, int caller_line) {
     inc_push(filename);
@@ -600,6 +657,11 @@ static Config parse_config(const char *filename) {
     return cfg;
 }
 
+/* Recursively walks a parsed value tree and fails with an error on the
+ * first REF that doesn't resolve, or that (directly or via a relative
+ * "same section" shorthand) points at itself. Doesn't detect longer
+ * cycles like a->b->a; that class of bug just becomes a very deep
+ * chain the 256-step guard in deref() (loader.c) eventually stops. */
 static void chk_refs(Config *cfg, Section *sec, Value *v, int ln,
                      const char *filename, const char *cur_path) {
     if (!v) return;
@@ -625,6 +687,11 @@ static void chk_refs(Config *cfg, Section *sec, Value *v, int ln,
     }
 }
 
+/* Runs chk_refs() over every key in every section. Note this only
+ * catches unresolved paths and direct/relative self-references; a
+ * longer cycle such as "a: b" / "b: a" (see samples/test9.mrc) passes
+ * here and is instead caught defensively by the depth guard in
+ * loader.c's deref() the first time someone actually reads it. */
 static void config_check_refs(Config *cfg) {
     for (int s=0; s<cfg->sectionCount; ++s) {
         Section *sec = &cfg->sections[s];
@@ -639,11 +706,17 @@ static void config_check_refs(Config *cfg) {
     }
 }
 
+/* Public entry point: parse a .mrc file and validate every reference in
+ * it before returning, so callers never see a REF that can't resolve. */
 Config config_open(const char *filename) {
     Config cfg = parse_config(filename);
     config_check_refs(&cfg);
     return cfg;
 }
+
+/* --- Binary writer ----------------------------------------------------
+ * Big-endian primitives mirroring loader.c's reader; see the README's
+ * "Binary Format" section for the on-disk layout these implement. */
 
 void write_u8(FILE *f, uint8_t v) {
     fwrite(&v, 1, 1, f);
@@ -687,12 +760,17 @@ void write_f64be(FILE *f, double v) {
     fwrite(b, 1, 8, f);
 }
 
+/* Length-prefixed string, length including the trailing NUL (matches
+ * what loader.c's read_str() expects). */
 void write_str(FILE *f, const char *s) {
     uint32_t len = (uint32_t)strlen(s) + 1;
     write_u32be(f, len);
     fwrite(s, 1, len, f);
 }
 
+/* Recursively writes one Value, tag byte first. Note VAL_REF is written
+ * as-is (unresolved) - the binary format never "bakes in" a REF's
+ * target, so config_load() + config_get_*() still follow it lazily. */
 void dump_val(FILE *f, const Value *v) {
     write_u8(f, (uint8_t)v->type);
     switch (v->type) {
@@ -723,6 +801,9 @@ void dump_val(FILE *f, const Value *v) {
 }
 
 
+/* Writes cfg to a brand-new binary file. Unlike config_update() (loader.c)
+ * this doesn't require cfg->_filename - it's the counterpart to
+ * config_open(), for "parse text once, ship binary" workflows. */
 void config_dump(Config *cfg, const char *fn) {
     FILE *f = fopen(fn, "wb");
     if (!f) { perror(fn); exit(1); }

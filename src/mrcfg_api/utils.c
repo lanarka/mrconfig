@@ -4,6 +4,8 @@
 #include <ctype.h>
 #include "utils.h"
 
+/* strdup() is not part of C99, and we want a version that never returns
+ * NULL silently, so every caller can skip the OOM check. */
 char *strdup_s(const char *s) {
     if (!s) return NULL;
     size_t n = strlen(s);
@@ -22,6 +24,8 @@ char *trim(char *s) {
     return s;
 }
 
+/* Counts backslashes directly before p; an odd count means the char at
+ * p is escaped (e.g. the closing '"' in "a\\" or the '$' in "\$FOO"). */
 int is_esc(const char *start, const char *p) {
     int n = 0;
     const char *q = p - 1;
@@ -29,6 +33,9 @@ int is_esc(const char *start, const char *p) {
     return n % 2;
 }
 
+/* Like strchr(), but skips occurrences of ch that fall inside a
+ * "quoted string". Used to find the ':' in a map entry without
+ * matching one that happens to be inside a string value. */
 char *find_outside_q(const char *s, char ch) {
     int q = 0;
     const char *o = s;
@@ -39,6 +46,9 @@ char *find_outside_q(const char *s, char ch) {
     return NULL;
 }
 
+/* Checks whether t is a full numeric literal: decimal/float, 0x hex, or
+ * 0b binary, with an optional leading sign. Used to decide INT/FLOAT vs
+ * STRING/REF for a bare (unquoted) token during parsing. */
 int is_num(const char *t) {
     if (!t || !*t) return 0;
     const char *p = t;
@@ -55,7 +65,7 @@ int is_num(const char *t) {
         while (*p) { if (*p!='0' && *p!='1') return 0; p++; }
         return 1;
     }
-    /* musi zacinat cislicou */
+    /* decimal/float must start with a digit here (sign already consumed) */
     if (!isdigit((unsigned char)*p)) return 0;
     int hd = 0, dot = 0, exp = 0;
     while (*p) {
@@ -72,6 +82,9 @@ int is_num(const char *t) {
     return hd;
 }
 
+/* Converts a token already validated by is_num() into a Value. Floats
+ * are detected by the presence of '.', 'e' or 'E'; everything else is
+ * parsed as INT (decimal, 0x hex, or 0b binary). */
 Value parse_num(const char *s) {
     Value v; memset(&v, 0, sizeof(v));
     if (strchr(s,'.') || strchr(s,'e') || strchr(s,'E')) {
@@ -90,6 +103,9 @@ Value parse_num(const char *s) {
     }
     return v;
 }
+
+/* Linear lookups below: fine for typical config sizes (tens to a few
+ * hundred sections/keys); would need an index if that ever changes. */
 
 Section *find_sec(Config *cfg, const char *name) {
     for (int i=0; i<cfg->sectionCount; ++i)
@@ -110,6 +126,9 @@ MapEntry *find_me(Value *mv, const char *key) {
     return NULL;
 }
 
+/* Recursive deep copy, needed because config_set_array()/config_set_map()
+ * take ownership of newly allocated storage rather than the caller's
+ * original items (the caller may free or reuse them afterwards). */
 Value deep_copy_val(const Value *v) {
     Value c; memset(&c, 0, sizeof(c)); c.type = v->type;
     switch (v->type) {
