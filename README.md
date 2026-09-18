@@ -3,6 +3,21 @@
 A simple yet powerful configuration file format for C99 projects.  
 Inspired by INI,TOML, extended with references, arrays, maps, environment variables, and an include system.
 
+The project has two parts:
+
+- **`mrcfg_api`** (`src/mrcfg_api/`) - the library: parses `.mrc` text, reads/writes the portable `.bin` format, and exposes the C API below. Build it as `libmrcfg_api.a` and link it into your own project.
+- **`mrcfg_cli`** (`src/mrcfg_cli/`) - a thin command-line tool built on top of the library, for parsing/printing or compiling a config from the shell.
+
+```
+mrconfig/
+├── src/
+│   ├── mrcfg_api/   # the library (mrcfg_cli and your own code both link against this)
+│   └── mrcfg_cli/   # the CLI tool's main.c
+├── examples/        # small demo programs against mrcfg_api
+├── tests/           # unit tests (test_api.c) + CLI smoke tests (run_cli_tests.sh)
+└── samples/         # example .mrc files, also used by the tests
+```
+
 ---
 
 ## Quick Start
@@ -21,6 +36,8 @@ port:    5432
 
 ```c
 #include "mrcfg.h"
+#include "compiler.h"   // config_open, config_dump
+#include "loader.h"     // config_get_*, config_set_*, config_load
 
 int main(void) {
     Config cfg = config_open("app.mrc");
@@ -133,7 +150,7 @@ Maps may contain references, arrays, and nested maps:
 data: { nums:   (10, 20, 30)
         first:  world.data.nums.0    // reference to the first array element
         nested: {x: 1 y: 2}
-)
+}
 ```
 
 ```c
@@ -189,7 +206,7 @@ label: "server: $HOST"   // interpolation inside a string
 ```
 
 ```bash
-PORT=8080 HOST=localhost ./mrcfg -c example.mrc
+PORT=8080 HOST=localhost ./mrcfg_cli -c example.mrc
 ```
 
 The ENV value is automatically converted to INT or FLOAT when it looks like a number.
@@ -373,6 +390,8 @@ keys: { users:   "user:*"
 
 ```c
 #include "mrcfg.h"
+#include "compiler.h"   // config_open, config_dump
+#include "loader.h"     // everything else below
 
 // Loading
 Config cfg = config_open("app.mrc");   // parse text config
@@ -429,7 +448,7 @@ config_print(&cfg);
 | `config_set_int(cfg, path, value)` | Change integer value |
 | `config_set_float(cfg, path, value)` | Change float value |
 | `config_set_str(cfg, path, value)` | Change string value |
-| `config_set_array(cfg, items, int)` | Change array list |
+| `config_set_array(cfg, path, items, count)` | Change array list |
 | `config_set_map(cfg, path, entries, count)` | Change map entries |
 | `config_update(cfg)` | Update changes |
 
@@ -441,13 +460,13 @@ config_print(&cfg);
 
 ```bash
 # Parse and print a text config
-./mrcfg -c config.mrc
+./mrcfg_cli -c config.mrc
 
 # Compile a text config to a portable binary
-./mrcfg -c config.mrc -o output.bin
+./mrcfg_cli -c config.mrc -o output.bin
 
 # Load a binary and print it
-./mrcfg -l output.bin
+./mrcfg_cli -l output.bin
 ```
 
 The binary file is identical across x86, ARM, MIPS, RISC-V — endianness and type sizes do not matter.
@@ -487,18 +506,31 @@ All multi-byte numbers are written in **big-endian** (network byte order):
 ## Build
 
 ```bash
-# build CLI tool and test runner
-make
-
-# clean
+make            # builds mrcfg_cli (CLI) and libmrcfg_api.a (API)
+make cli        # just the CLI tool
+make api        # just the static library
+make examples   # small demo programs, see examples/README.md
+make test       # unit tests (tests/test_api.c) + CLI smoke tests (tests/run_cli_tests.sh)
 make clean
 ```
 
+Requires only a C99 compiler (`gcc`/`clang`) and `make` — no external dependencies.
+
 ### Linking into your own project
 
+Either link the prebuilt static library:
+
 ```bash
-gcc -std=c99 -o my_app my_app.c src/mrcfg.c
+make api
+gcc -std=c99 -Isrc/mrcfg_api -o my_app my_app.c -L. -lmrcfg_api
 ```
 
-Only two files are needed: `src/mrcfg.h` and `src/mrcfg.c`. No external dependencies.
+or compile the three library source files straight into your project:
+
+```bash
+gcc -std=c99 -Isrc/mrcfg_api -o my_app my_app.c \
+    src/mrcfg_api/compiler.c src/mrcfg_api/loader.c src/mrcfg_api/utils.c
+```
+
+Either way, `#include "mrcfg.h"`, `"compiler.h"` and `"loader.h"` (from `src/mrcfg_api/`) is all you need — no other dependencies. See `examples/` for complete, runnable programs.
 
